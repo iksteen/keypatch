@@ -321,6 +321,18 @@ class Keypatch_Asm:
         asm = "{0} {1}".format(mnem, ','.join(opers))
         return asm
 
+    def ida_resolve_multi(self, assembly, address=idc.BADADDR, arch=None, mode=None, syntax=None):
+        asm = []
+        for line in assembly.split('\n'):
+            if not line.strip():
+                continue
+            line = self.ida_resolve(line, address)
+            asm.append(line)
+            encoding, _ = self.assemble(line, address, arch=arch, mode=mode, syntax=syntax)
+            if encoding is not None:
+                address += len(encoding)
+        return '\n'.join(asm)
+
     # return bytes of instruction or data
     # return None on failure
     def ida_get_item(self, address, hex_output=False):
@@ -883,7 +895,7 @@ class Keypatch_Asm:
 # Common ancestor form to be derived by Patcher, FillRange & Search
 class Keypatch_Form(idaapi.Form):
     # prepare for form initializing
-    def setup(self, kp_asm, address, assembly=None):
+    def setup(self, kp_asm, address, addr_end, assembly=None):
         self.kp_asm = kp_asm
         self.address = address
 
@@ -907,14 +919,26 @@ class Keypatch_Form(idaapi.Form):
         if self.kp_asm.arch == KS_ARCH_X86:
             self.syntax_id = self.kp_asm.find_syntax_idx(self.kp_asm.syntax)
 
-        # get original instruction and bytes
-        self.orig_asm = kp_asm.ida_get_disasm(address)
-        (self.orig_encoding, self.orig_len) = kp_asm.ida_get_item(address, hex_output=True)
-        if self.orig_encoding is None:
-            self.orig_encoding = ''
+        # get original instructions and bytes
+        orig_len = 0
+        orig_asm = []
+        orig_encoding = []
+        fixup_asm = []
+        while address + orig_len <= addr_end:
+            orig_asm.append(kp_asm.ida_get_disasm(address + orig_len))
+            fixup_asm.append(kp_asm.ida_get_disasm(address + orig_len, fixup=True))
+            item_encoding, item_len = kp_asm.ida_get_item(address + orig_len, hex_output=True)
+            if item_encoding is None:
+                orig_encoding.append('')
+            else:
+                orig_encoding.append(item_encoding)
+            orig_len += item_len
+        self.orig_asm = '\n'.join(orig_asm)
+        self.orig_encoding = ' '.join(orig_encoding)
+        self.orig_len = orig_len
 
         if assembly is None:
-            self.asm = self.kp_asm.ida_get_disasm(self.address, fixup=True)
+            self.asm = '\n'.join(fixup_asm)
         else:
             self.asm = assembly
 
@@ -935,8 +959,13 @@ class Keypatch_Form(idaapi.Form):
                 address = 0
 
             assembly = self.GetControlValue(self.c_assembly)
-            raw_assembly = self.kp_asm.ida_resolve(assembly, address)
-            self.SetControlValue(self.c_raw_assembly, raw_assembly)
+            if isinstance(assembly, idaapi.textctrl_info_t):
+                assembly = assembly.text
+
+            raw_assembly = self.kp_asm.ida_resolve_multi(assembly, address, arch=arch, mode=mode,
+                                                         syntax=syntax)
+            if self.c_raw_assembly is not None:
+                self.SetControlValue(self.c_raw_assembly, raw_assembly)
 
             (encoding, count) =  self.kp_asm.assemble(raw_assembly, address, arch=arch,
                                                     mode=mode, syntax=syntax)
@@ -997,8 +1026,7 @@ class Keypatch_Form(idaapi.Form):
 
     # update some controls - including Encoding control
     def update_controls(self, arch, mode):
-        # Fixup & Encoding-len are read-only controls
-        self.EnableField(self.c_raw_assembly, False)
+        # Encoding-len is read-only control
         self.EnableField(self.c_encoding_len, False)
 
         # Encoding is enable to allow user to select & copy
@@ -1086,7 +1114,7 @@ KEYPATCH:: Fill Range
 # Patcher form
 class Keypatch_Patcher(Keypatch_Form):
     def __init__(self, kp_asm, address, assembly=None, opts=None):
-        self.setup(kp_asm, address, assembly)
+        self.setup(kp_asm, address, address, assembly)
 
         # create Patcher form
         super(Keypatch_Patcher, self).__init__(
@@ -1136,6 +1164,61 @@ KEYPATCH:: Patcher
         self.EnableField(self.c_orig_assembly, False)
         self.EnableField(self.c_orig_encoding, False)
         self.EnableField(self.c_orig_len, False)
+        self.EnableField(self.c_raw_assembly, False)
+
+        return self.update_patchform(fid)
+
+
+# Multi-patcher form
+class Keypatch_RangePatcher(Keypatch_Form):
+    def __init__(self, kp_asm, addr_begin, addr_end, assembly=None, opts=None):
+        self.setup(kp_asm, addr_begin, addr_end, assembly)
+
+        # create Patcher form
+        super(Keypatch_RangePatcher, self).__init__(
+            r"""STARTITEM {id:c_assembly}
+BUTTON YES* Patch
+KEYPATCH:: Patcher
+
+            {FormChangeCb}
+            <Endian :{c_endian} >
+            <Address:{c_addr}>
+            <~S~yntax :{c_syntax}>
+            <Original:{c_orig_assembly}><P~a~tched:{c_assembly}>
+            Encoding:
+            <:{c_orig_encoding}><:{c_encoding}>
+            <Size:{c_orig_len}>                  <Size:{c_encoding_len}>
+            <~N~OPs padding until next instruction boundary:{c_opt_padding}>
+            <Save ~o~riginal instructions in IDA comment:{c_opt_comment}>{c_opt_chk}>
+            """, {
+                'c_endian': self.DropdownListControl(
+                    items=self.kp_asm.endian_lists.keys(),
+                    readonly=True,
+                    selval=self.endian_id),
+                'c_addr': self.NumericInput(value=addr_begin, swidth=MAX_ADDRESS_LEN, tp=self.FT_ADDR),
+                'c_syntax': self.DropdownListControl(
+                    items=self.syntax_keys,
+                    readonly=True,
+                    selval=self.syntax_id),
+                'c_orig_assembly': self.MultiLineTextControl(text=self.orig_asm, swidth=30),
+                'c_orig_encoding': self.StringInput(value=self.orig_encoding, swidth=30),
+                'c_orig_len': self.NumericInput(value=self.orig_len, swidth=8, tp=self.FT_DEC),
+                'c_assembly': self.MultiLineTextControl(text=self.asm, swidth=30),
+                'c_encoding': self.StringInput(value='', swidth=30),
+                'c_encoding_len': self.NumericInput(value=0, swidth=8, tp=self.FT_DEC),
+                'c_opt_chk': self.ChkGroupControl(('c_opt_padding', 'c_opt_comment', ''), value=opts['c_opt_chk']),
+                'FormChangeCb': self.FormChangeCb(self.OnFormChange),
+            })
+
+        self.Compile()
+        self.c_raw_assembly = None
+
+    # callback to be executed when any form control changed
+    def OnFormChange(self, fid):
+        # make some fields read-only in Patch mode
+        self.EnableField(self.c_orig_assembly, False)
+        self.EnableField(self.c_orig_encoding, False)
+        self.EnableField(self.c_orig_len, False)
 
         return self.update_patchform(fid)
 
@@ -1178,7 +1261,7 @@ class SearchResultChooser(idaapi.Choose2):
 # Search form
 class Keypatch_Search(Keypatch_Form):
     def __init__(self, kp_asm, address, assembly=None):
-        self.setup(kp_asm, address, assembly)
+        self.setup(kp_asm, address, address, assembly)
 
         # create Search form
         super(Keypatch_Search, self).__init__(
@@ -1234,6 +1317,8 @@ KEYPATCH:: Search
             c = SearchResultChooser("Searching for [{0}]".format(self.GetControlValue(self.c_raw_assembly)), addresses)
             c.show()
             return 1
+
+        self.EnableField(self.c_raw_assembly, False)
 
         # only Search mode allows to select arch+mode
         arch_id = self.GetControlValue(self.c_arch)
@@ -1647,19 +1732,19 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
             idc.Warning("ERROR: Keypatch cannot handle this architecture (unsupported by Keystone), quit!")
             return
 
-        selection, addr_begin, addr_end = idaapi.read_selection()
-        if selection:
-            # call Fill Range function on this selected code
-            return self.fill_range()
-
-        address = idc.ScreenEA()
+        selection, address, addr_end = idaapi.read_selection()
+        if not selection:
+            address = idc.ScreenEA()
 
         if self.opts is None:
             self.load_configuration()
 
         init_assembly = None
         while True:
-            f = Keypatch_Patcher(self.kp_asm, address, assembly=init_assembly, opts=self.opts)
+            if not selection:
+                f = Keypatch_Patcher(self.kp_asm, address, assembly=init_assembly, opts=self.opts)
+            else:
+                f = Keypatch_RangePatcher(self.kp_asm, address, addr_end, assembly=init_assembly, opts=self.opts)
             ok = f.Execute()
             if ok == 1:
                 try:
@@ -1673,13 +1758,15 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
                     padding = (self.opts.get("c_opt_padding", 0) != 0)
                     comment = (self.opts.get("c_opt_comment", 0) != 0)
 
-                    raw_assembly = self.kp_asm.ida_resolve(assembly, address)
+                    raw_assembly = self.kp_asm.ida_resolve_multi(assembly, address, syntax=syntax)
 
                     print("Keypatch: attempting to modify \"{0}\" at 0x{1:X} to \"{2}\"".format(
-                            self.kp_asm.ida_get_disasm(address), address, assembly))
+                        self.kp_asm.ida_get_disasm(address), address, raw_assembly))
 
                     length = self.kp_asm.patch_code(address, raw_assembly, syntax, padding, comment, None)
                     if length > 0:
+                        if selection:
+                            break
                         # update start address pointing to the next instruction
                         init_assembly = None
                         address += length
