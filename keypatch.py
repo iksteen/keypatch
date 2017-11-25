@@ -652,9 +652,6 @@ class Keypatch_Asm:
     # patch at address, return the number of written bytes & original data
     # on patch failure, we revert to the original code, then return (None, None)
     def patch(self, address, patch_data, len):
-        # save original function end to fix IDA re-analyze issue after patching
-        orig_func_end = idc.GetFunctionAttr(address, idc.FUNCATTR_END)
-
         (patched_len, orig_data) = self.patch_raw(address, patch_data, len)
 
         if len != patched_len:
@@ -672,14 +669,9 @@ class Keypatch_Asm:
             return (None, None)
 
         # ask IDA to re-analyze the patched area
-        if orig_func_end == idc.BADADDR:
-            # only analyze patched bytes, otherwise it would take a lot of time to re-analyze the whole binary
-            idaapi.analyze_area(address, address + patched_len + 1)
-        else:
-            idaapi.analyze_area(address, orig_func_end)
-
-            # try to fix IDA function re-analyze issue after patching
-            idaapi.func_setend(address, orig_func_end)
+        idaapi.do_unknown_range(address, patched_len, idaapi.DOUNK_SIMPLE)
+        idaapi.auto_mark_range(address, address + patched_len + 1, idaapi.AU_CODE)
+        idaapi.autoWait()
 
         return (patched_len, orig_data)
 
